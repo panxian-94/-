@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-日报风格新闻推送（朋友圈版）
-特性：农历日期、AI板块概述+微语、高时效、多源精选
+日报风格新闻推送（自动翻译英文版）
+特性：农历日期、英文自动转中文、AI板块概述+微语、高时效、多源精选
 """
 
 import os, sys, time, hashlib, logging, requests, feedparser, re, json
@@ -23,6 +23,9 @@ ENABLE_AI = os.environ.get("ENABLE_AI_SUMMARY", "true").lower() == "true"
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-chat")
+
+# 翻译触发阈值：ASCII字符占比超过此值则翻译
+TRANSLATE_THRESHOLD = 0.3
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -57,7 +60,6 @@ KEYWORD_SCORES = {
 }
 
 def get_lunar_date():
-    """返回农历日期字符串，如 六月十八"""
     today = datetime.now()
     lunar = ZhDate.from_datetime(today)
     return lunar.chinese()
@@ -182,17 +184,57 @@ def score_and_select(category: str, news_list: List[Dict], target: int = 50) -> 
                 item["title"] += " [信源待核实]"
     return selected
 
+def is_english_text(text: str, threshold: float = TRANSLATE_THRESHOLD) -> bool:
+    """判断文本是否英文占多数"""
+    if not text:
+        return False
+    ascii_count = sum(1 for c in text if ord(c) < 128)
+    # 忽略空格和标点
+    total = len(text.strip())
+    if total == 0:
+        return False
+    ratio = ascii_count / total
+    return ratio > threshold
+
+def translate_text(text: str) -> str:
+    """调用 AI 翻译英文到中文"""
+    if not LLM_API_KEY:
+        return text
+    try:
+        prompt = f"将以下英文翻译成中文，只返回翻译结果，不要解释：\n{text}"
+        headers = {"Authorization": f"Bearer {LLM_API_KEY}"}
+        data = {
+            "model": LLM_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1,
+        }
+        resp = requests.post(f"{LLM_BASE_URL}/chat/completions", json=data, headers=headers, timeout=15)
+        resp.raise_for_status()
+        result = resp.json()["choices"][0]["message"]["content"].strip()
+        return result
+    except Exception as e:
+        logger.error(f"翻译失败: {e}")
+        return text
+
+def translate_news_items(sections: Dict[str, List[Dict]]):
+    """遍历所有新闻，将英文标题和摘要翻译成中文"""
+    for sec_name, items in sections.items():
+        for item in items:
+            if is_english_text(item["title"]):
+                logger.info(f"翻译标题: {item['title'][:50]}...")
+                item["title"] = translate_text(item["title"])
+            if is_english_text(item["summary"]):
+                logger.info(f"翻译摘要: {item['summary'][:50]}...")
+                item["summary"] = translate_text(item["summary"])
+
 def ai_generate_intro_and_motto(sections: Dict[str, List[Dict]]) -> Dict:
-    """使用AI生成每个板块的一句概括和最后的微语"""
     if not ENABLE_AI or not LLM_API_KEY:
         return {"intros": {}, "motto": ""}
-
     try:
         all_titles = []
         for sec_name, items in sections.items():
             for item in items:
                 all_titles.append(f"[{sec_name}] {item['title']}")
-
         prompt = (
             "你是一位新闻主编。请根据以下今日新闻标题，完成两个任务：\n"
             "1. 为每个分类（国内新闻、国际新闻、湖北武汉本地动态、AI对普通人的影响）生成一句15字以内的今日主题概括。\n"
@@ -209,7 +251,6 @@ def ai_generate_intro_and_motto(sections: Dict[str, List[Dict]]) -> Dict:
             "}\n\n"
             "新闻标题列表：\n" + "\n".join(all_titles)
         )
-
         headers = {"Authorization": f"Bearer {LLM_API_KEY}"}
         data = {
             "model": LLM_MODEL,
@@ -231,7 +272,6 @@ def format_message(sections: Dict[str, List[Dict]], ai_extra: Dict) -> str:
     weekday = ["星期一","星期二","星期三","星期四","星期五","星期六","星期日"][now.weekday()]
     date_str = now.strftime("%Y年%m月%d日")
     lunar_str = get_lunar_date()
-    # 关键修改：将“微语报”改为“日报”
     header = f"{date_str}日报，{weekday}，农历{lunar_str}，工作愉快，生活喜乐！\n"
 
     order = ["国内新闻", "国际新闻", "湖北武汉本地动态", "AI对普通人的影响"]
@@ -265,7 +305,7 @@ def push_to_wechat(title: str, content: str):
     logger.info("推送成功")
 
 def main():
-    logger.info("开始日报新闻抓取...")
+    logger.info("开始日报新闻抓取（自动翻译英文）...")
     raw_pool = collect_all_news()
 
     section_map = {
@@ -287,10 +327,12 @@ def main():
     for sec_name in sections:
         sections[sec_name] = score_and_select(sec_name, sections[sec_name])
 
+    # 新增：翻译英文新闻
+    translate_news_items(sections)
+
     ai_extra = ai_generate_intro_and_motto(sections)
 
     message = format_message(sections, ai_extra)
-    # 推送标题也改为“日报”
     push_to_wechat("每日日报", message)
 
 if __name__ == "__main__":

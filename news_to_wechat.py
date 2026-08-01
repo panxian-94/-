@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-日报风格新闻推送（自动翻译英文版）
-特性：农历日期、英文自动转中文、AI板块概述+微语、高时效、多源精选
+日报风格新闻推送（智谱AI免费翻译 + 调试版）
 """
 
 import os, sys, time, hashlib, logging, requests, feedparser, re, json
@@ -18,19 +17,16 @@ TODAY = datetime.now(TZ_BEIJING).strftime("%Y-%m-%d")
 MAX_WORKERS = 8
 REQUEST_TIMEOUT = 10
 
-# AI 配置
+# AI 配置（默认使用智谱AI GLM-4-Flash）
 ENABLE_AI = os.environ.get("ENABLE_AI_SUMMARY", "true").lower() == "true"
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/v1")
-LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-chat")
-
-# 翻译触发阈值：ASCII字符占比超过此值则翻译
-TRANSLATE_THRESHOLD = 0.3
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
+LLM_MODEL = os.environ.get("LLM_MODEL", "glm-4-flash")
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-# ---------- 扩展 RSS 源 ----------
+# ---------- RSS 源 ----------
 RSS_FEEDS = [
     {"url": "http://www.xinhuanet.com/politics/xhsll.xml", "category": "国内", "trust": 1.0},
     {"url": "http://www.people.com.cn/rss/politics.xml", "category": "国内", "trust": 1.0},
@@ -184,51 +180,53 @@ def score_and_select(category: str, news_list: List[Dict], target: int = 50) -> 
                 item["title"] += " [信源待核实]"
     return selected
 
-def is_english_text(text: str, threshold: float = TRANSLATE_THRESHOLD) -> bool:
-    """判断文本是否英文占多数"""
+def is_english_text(text: str) -> bool:
+    """只要没有汉字就视为需翻译的英文"""
     if not text:
         return False
-    ascii_count = sum(1 for c in text if ord(c) < 128)
-    # 忽略空格和标点
-    total = len(text.strip())
-    if total == 0:
-        return False
-    ratio = ascii_count / total
-    return ratio > threshold
+    for ch in text:
+        if '\u4e00' <= ch <= '\u9fff':
+            return False
+    return True
 
 def translate_text(text: str) -> str:
-    """调用 AI 翻译英文到中文"""
     if not LLM_API_KEY:
+        logger.warning("LLM_API_KEY 未配置，跳过翻译")
         return text
     try:
-        prompt = f"将以下英文翻译成中文，只返回翻译结果，不要解释：\n{text}"
+        prompt = f"将以下英文翻译成中文，只返回翻译结果：\n{text}"
         headers = {"Authorization": f"Bearer {LLM_API_KEY}"}
         data = {
             "model": LLM_MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.1,
         }
-        resp = requests.post(f"{LLM_BASE_URL}/chat/completions", json=data, headers=headers, timeout=15)
-        resp.raise_for_status()
+        url = f"{LLM_BASE_URL}/chat/completions"
+        logger.debug(f"请求翻译: URL={url}")
+        resp = requests.post(url, json=data, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            logger.error(f"翻译请求失败: {resp.status_code} {resp.text[:200]}")
+            return text
         result = resp.json()["choices"][0]["message"]["content"].strip()
+        logger.info(f"翻译成功: {text[:30]} -> {result[:30]}")
         return result
     except Exception as e:
-        logger.error(f"翻译失败: {e}")
+        logger.error(f"翻译异常: {e}")
         return text
 
 def translate_news_items(sections: Dict[str, List[Dict]]):
-    """遍历所有新闻，将英文标题和摘要翻译成中文"""
+    logger.info("开始检查英文新闻...")
     for sec_name, items in sections.items():
         for item in items:
             if is_english_text(item["title"]):
-                logger.info(f"翻译标题: {item['title'][:50]}...")
+                logger.info(f"发现英文标题: {item['title'][:50]}")
                 item["title"] = translate_text(item["title"])
             if is_english_text(item["summary"]):
-                logger.info(f"翻译摘要: {item['summary'][:50]}...")
                 item["summary"] = translate_text(item["summary"])
 
 def ai_generate_intro_and_motto(sections: Dict[str, List[Dict]]) -> Dict:
     if not ENABLE_AI or not LLM_API_KEY:
+        logger.info("AI未启用或无API Key，跳过概括生成")
         return {"intros": {}, "motto": ""}
     try:
         all_titles = []
@@ -237,19 +235,10 @@ def ai_generate_intro_and_motto(sections: Dict[str, List[Dict]]) -> Dict:
                 all_titles.append(f"[{sec_name}] {item['title']}")
         prompt = (
             "你是一位新闻主编。请根据以下今日新闻标题，完成两个任务：\n"
-            "1. 为每个分类（国内新闻、国际新闻、湖北武汉本地动态、AI对普通人的影响）生成一句15字以内的今日主题概括。\n"
-            "2. 生成一句50字以内的微语（正能量感悟或哲理句子），作为今日结语。\n"
-            "返回JSON格式：\n"
-            "{\n"
-            "  \"intros\": {\n"
-            "    \"国内新闻\": \"...\",\n"
-            "    \"国际新闻\": \"...\",\n"
-            "    \"湖北武汉本地动态\": \"...\",\n"
-            "    \"AI对普通人的影响\": \"...\"\n"
-            "  },\n"
-            "  \"motto\": \"...\"\n"
-            "}\n\n"
-            "新闻标题列表：\n" + "\n".join(all_titles)
+            "1. 为每个分类生成一句15字以内的主题概括。\n"
+            "2. 生成一句50字以内的正能量微语。\n"
+            "返回JSON：{\"intros\":{\"国内新闻\":\"...\",\"国际新闻\":\"...\",\"湖北武汉本地动态\":\"...\",\"AI对普通人的影响\":\"...\"},\"motto\":\"...\"}\n\n"
+            + "\n".join(all_titles)
         )
         headers = {"Authorization": f"Bearer {LLM_API_KEY}"}
         data = {
@@ -259,12 +248,14 @@ def ai_generate_intro_and_motto(sections: Dict[str, List[Dict]]) -> Dict:
             "response_format": {"type": "json_object"}
         }
         resp = requests.post(f"{LLM_BASE_URL}/chat/completions", json=data, headers=headers, timeout=30)
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            logger.error(f"概括生成失败: {resp.status_code} {resp.text[:200]}")
+            return {"intros": {}, "motto": ""}
         result = json.loads(resp.json()["choices"][0]["message"]["content"])
-        logger.info("AI板块概括与微语生成完成")
+        logger.info("AI概括生成成功")
         return {"intros": result.get("intros", {}), "motto": result.get("motto", "")}
     except Exception as e:
-        logger.error(f"AI生成失败: {e}")
+        logger.error(f"AI概括异常: {e}")
         return {"intros": {}, "motto": ""}
 
 def format_message(sections: Dict[str, List[Dict]], ai_extra: Dict) -> str:
@@ -292,7 +283,6 @@ def format_message(sections: Dict[str, List[Dict]], ai_extra: Dict) -> str:
     motto = ai_extra.get("motto", "")
     if motto:
         body += f"【微语】{motto}\n"
-
     return header + body
 
 def push_to_wechat(title: str, content: str):
@@ -305,33 +295,29 @@ def push_to_wechat(title: str, content: str):
     logger.info("推送成功")
 
 def main():
-    logger.info("开始日报新闻抓取（自动翻译英文）...")
-    raw_pool = collect_all_news()
+    logger.info("=== 开始日报新闻抓取 ===")
+    # 打印当前AI配置（隐藏key）
+    logger.info(f"AI启用: {ENABLE_AI}, 模型: {LLM_MODEL}, BaseURL: {LLM_BASE_URL}")
+    logger.info(f"LLM_API_KEY 是否配置: {'是' if LLM_API_KEY else '否'}")
 
+    raw_pool = collect_all_news()
     section_map = {
-        "国内": "国内新闻",
-        "国际": "国际新闻",
-        "武汉": "湖北武汉本地动态",
-        "AI": "AI对普通人的影响",
+        "国内": "国内新闻", "国际": "国际新闻",
+        "武汉": "湖北武汉本地动态", "AI": "AI对普通人的影响",
     }
-    sections = {
-        "国内新闻": [],
-        "国际新闻": [],
-        "湖北武汉本地动态": [],
-        "AI对普通人的影响": [],
-    }
+    sections = {v:[] for v in section_map.values()}
     for raw_cat, news_list in raw_pool.items():
-        sec_name = section_map.get(raw_cat, "国内新闻")
-        sections[sec_name].extend(news_list)
+        sec_name = section_map.get(raw_cat)
+        if sec_name:
+            sections[sec_name].extend(news_list)
 
     for sec_name in sections:
         sections[sec_name] = score_and_select(sec_name, sections[sec_name])
 
-    # 新增：翻译英文新闻
+    # 翻译英文
     translate_news_items(sections)
 
     ai_extra = ai_generate_intro_and_motto(sections)
-
     message = format_message(sections, ai_extra)
     push_to_wechat("每日日报", message)
 

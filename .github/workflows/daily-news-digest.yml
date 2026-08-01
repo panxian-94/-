@@ -24,7 +24,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 运行新闻推送脚本
+        - name: 运行新闻推送脚本
         env:
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}

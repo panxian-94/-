@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-新闻+天气双板块日报
+新闻+天气双板块日报（修复版）
 新闻子类：国内/国际/武汉/股票/便利店/人口/婚恋 各5条
-天气：武汉7日预报及提醒
+天气：武汉7日预报及提醒（可选，需和风天气API Key）
 智谱AI摘要+微语，PushPlus推送
 """
 
@@ -13,13 +13,13 @@ from typing import List, Dict, Optional
 
 # ---------- 配置 ----------
 PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "")
-WEATHER_API_KEY = os.environ.get("WEATHER_API_KEY", "")  # 和风天气Key
+WEATHER_API_KEY = os.environ.get("WEATHER_API_KEY", "")  # 和风天气Key，可选
 TZ_BEIJING = timezone(timedelta(hours=8))
 TODAY = datetime.now(TZ_BEIJING).strftime("%Y-%m-%d")
 MAX_WORKERS = 8
 REQUEST_TIMEOUT = 12
 
-# 智谱AI
+# 智谱AI（用于摘要和翻译）
 ENABLE_AI = os.environ.get("ENABLE_AI_SUMMARY", "true").lower() == "true"
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
@@ -159,8 +159,9 @@ def collect_news() -> Dict[str, List[Dict]]:
                 logger.warning(f"任务异常: {e}")
     return pool
 
-def select_top(sub: str, news_list: List[Dict], count=5) -> List[Dict]:
-    # 去重
+def select_top(sub: str, news_list: List[Dict], global_news: List[Dict], count=5) -> List[Dict]:
+    """从 news_list 中选 count 条，不足则从 global_news 中补足（全局备选）"""
+    # 去重（按标题）
     seen = set()
     unique = []
     for item in sorted(news_list, key=lambda x: x["time"], reverse=True):
@@ -169,19 +170,31 @@ def select_top(sub: str, news_list: List[Dict], count=5) -> List[Dict]:
             continue
         seen.add(h)
         unique.append(item)
+
     # 关键词评分
     kw = KEYWORD_SCORES.get(sub, [])
     for item in unique:
         score = sum(1 for w in kw if w in item["title"])
         item["_score"] = score
+
     ranked = sorted(unique, key=lambda x: (x["_score"], x["time"]), reverse=True)
-    # 保底5条
     selected = ranked[:count]
-    if len(selected) < count:
-        # 从全局借用
-        all_news = [item for lst in pool.values() for item in lst]
-        rest = [item for item in all_news if item not in selected]
-        selected += sorted(rest, key=lambda x: x["time"], reverse=True)[:count-len(selected)]
+
+    # 如果不足，从全局新闻中借用（同样去重）
+    if len(selected) < count and global_news:
+        seen_titles = {item["title"] for item in selected}
+        rest = []
+        for item in sorted(global_news, key=lambda x: x["time"], reverse=True):
+            if item["title"] not in seen_titles:
+                rest.append(item)
+                seen_titles.add(item["title"])
+        # 对借用新闻简单评分
+        for item in rest:
+            score = sum(1 for w in kw if w in item["title"])
+            item["_score"] = score
+        rest_sorted = sorted(rest, key=lambda x: (x["_score"], x["time"]), reverse=True)
+        selected += rest_sorted[:count-len(selected)]
+
     return selected[:count]
 
 # ========== 翻译 ==========
@@ -241,11 +254,9 @@ def build_message(selected_pool: Dict[str, List[Dict]], weather_text: str, ai_te
     date_str = now.strftime("%Y年%m月%d日")
     header = f"{date_str} 日报 {weekday}\n"
 
-    # 天气板块
     if weather_text:
         header += weather_text + "\n"
 
-    # 新闻板块
     body = "━━━━━━ 今日新闻 ━━━━━━\n"
     for sub, full_name in NEWS_SUBCATEGORIES.items():
         items = selected_pool.get(sub, [])
@@ -257,7 +268,6 @@ def build_message(selected_pool: Dict[str, List[Dict]], weather_text: str, ai_te
                 body += f"  {i}. {item['title']}\n"
     body += "\n"
 
-    # AI 摘要
     if ai_text:
         body += f"{ai_text}\n"
 
@@ -277,10 +287,15 @@ def main():
     raw_news = collect_news()
     translate_news(raw_news)
 
+    # 生成全局新闻列表（用于兜底补充）
+    all_news_flat = []
+    for lst in raw_news.values():
+        all_news_flat.extend(lst)
+
     # 精选每个子类5条
     selected = {}
     for sub in NEWS_SUBCATEGORIES:
-        selected[sub] = select_top(sub, raw_news.get(sub, []))
+        selected[sub] = select_top(sub, raw_news.get(sub, []), all_news_flat)
 
     # 天气
     daily = get_wuhan_weather()

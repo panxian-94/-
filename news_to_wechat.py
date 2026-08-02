@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-超级日报（增强版）：爬虫+社交媒体聚合+缓存去重
-智谱AI翻译+摘要，6分类每类5条，全自动去重
+超级日报（必须有内容版）：爬虫+社交媒体聚合+智能缓存去重
+智谱AI翻译+摘要，6分类每类5条，绝不空推
 """
 
 import os, sys, time, hashlib, logging, requests, feedparser, re, json, subprocess
@@ -19,7 +19,7 @@ TODAY = datetime.now(TZ_BEIJING).strftime("%Y-%m-%d")
 MAX_WORKERS = 12
 REQUEST_TIMEOUT = 15
 
-# 缓存文件路径
+# 缓存文件
 CACHE_DIR = "cache"
 CACHE_FILE = os.path.join(CACHE_DIR, "pushed_hashes.json")
 
@@ -32,16 +32,14 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "glm-4-flash")
 logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-# ========== 1. 原有RSS源 + 社交媒体搜索聚合源 ==========
+# ========== 1. RSS源 + 社交媒体聚合 ==========
 RSS_FEEDS = [
-    # 国内新闻（传统源）
+    # 国内新闻
     {"url": "http://www.xinhuanet.com/politics/xhsll.xml", "category": "国内"},
     {"url": "http://www.people.com.cn/rss/politics.xml", "category": "国内"},
     {"url": "https://www.chinanews.com/rss/rss_1.html", "category": "国内"},
     {"url": "https://www.thepaper.cn/rss_news_1.xml", "category": "国内"},
-    # 百度聚合（国内综合）
     {"url": "https://news.baidu.com/ns?word=%E4%B8%AD%E5%9B%BD+%E7%BB%8F%E6%B5%8E+%E6%B0%91%E7%94%9F&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "国内"},
-    # 社交媒体关键词聚合：抖音、小红书、公众号、微博、知乎
     {"url": "https://news.baidu.com/ns?word=%E6%8A%96%E9%9F%B3+%E7%83%AD%E6%90%9C&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "国内"},
     {"url": "https://news.baidu.com/ns?word=%E5%B0%8F%E7%BA%A2%E4%B9%A6+%E7%83%AD%E9%97%A8&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "国内"},
     {"url": "https://news.baidu.com/ns?word=%E5%BE%AE%E4%BF%A1%E5%85%AC%E4%BC%97%E5%8F%B7+%E7%83%AD%E6%96%87&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "国内"},
@@ -55,28 +53,26 @@ RSS_FEEDS = [
     {"url": "http://www.cnhubei.com/rss/whxw.xml", "category": "武汉"},
     {"url": "http://hb.people.com.cn/rss/hubei.xml", "category": "武汉"},
     {"url": "https://news.baidu.com/ns?word=%E6%AD%A6%E6%B1%89+%E6%B9%96%E5%8C%97+%E5%9C%B0%E9%93%81+%E5%A4%A9%E6%B0%94&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "武汉"},
-    # AI 影响
+    # AI
     {"url": "https://www.36kr.com/feed", "category": "AI"},
     {"url": "https://www.huxiu.com/rss/0.html", "category": "AI"},
     {"url": "https://news.baidu.com/ns?word=%E4%BA%BA%E5%B7%A5%E6%99%BA%E8%83%BD+AI+%E5%A4%A7%E6%A8%A1%E5%9E%8B&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "AI"},
-    # 便利店行业
+    # 便利店
     {"url": "https://news.baidu.com/ns?word=%E4%BE%BF%E5%88%A9%E5%BA%97+%E9%9B%B6%E5%94%AE+%E5%BF%AB%E6%B6%88&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "便利店"},
-    # 股票情报
+    # 股票
     {"url": "https://www.cls.cn/api/sw?app=CailianpressWeb&os=web&sv=8.4.6", "category": "股票"},
     {"url": "https://news.baidu.com/ns?word=%E8%82%A1%E5%B8%82+%E9%9B%B6%E5%94%AE+%E6%B6%88%E8%B4%B9+%E5%AE%8F%E8%A7%82%E7%BB%8F%E6%B5%8E&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "股票"},
 ]
 
 # ========== 2. 网页爬虫目标 ==========
 SCRAPE_TARGETS = [
-    # 便利店相关
     {"url": "http://www.linkshop.com/news/", "category": "便利店",
      "title_selector": "div.newslist ul li a", "link_attr": "href", "base": "http://www.linkshop.com"},
-    # 武汉政府公告
     {"url": "http://www.wuhan.gov.cn/sy/whyw/", "category": "武汉",
      "title_selector": "ul.list li a", "link_attr": "href", "base": "http://www.wuhan.gov.cn"},
 ]
 
-# ========== 关键词评分表 ==========
+# ========== 关键词评分 ==========
 KEYWORD_SCORES = {
     "国内新闻": {"中国":10,"国内":10,"抖音":8,"小红书":8,"公众号":8,"微博":8,"知乎":8,"经济":5,"就业":5},
     "国际新闻": {"美国":10,"欧洲":10,"日本":10,"俄罗斯":10,"美联储":5,"汇率":5,"油价":5,"芯片":5},
@@ -95,29 +91,38 @@ FALLBACK_KEYWORDS = {
     "股票行业情报": ["股市","A股","股票"],
 }
 
-# ========== 缓存去重 ==========
+# ========== 缓存处理（仅保留当天哈希） ==========
 def load_pushed_hashes() -> Set[str]:
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
         if os.path.exists(CACHE_FILE):
             with open(CACHE_FILE, "r") as f:
-                return set(json.load(f))
+                data = json.load(f)
+                # 只保留今天的哈希（格式：hash@日期）
+                today_hashes = {h for h in data if h.endswith(f"@{TODAY}")}
+                return today_hashes
     except:
         pass
     return set()
 
-def save_pushed_hashes(hashes: Set[str]):
+def save_pushed_hashes(new_hashes: Set[str]):
     os.makedirs(CACHE_DIR, exist_ok=True)
+    # 读取旧文件，合并新哈希
+    old = set()
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE, "r") as f:
+            old = set(json.load(f))
+    # 移除今天以前的哈希（防止文件无限增大）
+    old = {h for h in old if h.endswith(f"@{TODAY}")}
+    old.update(new_hashes)
     with open(CACHE_FILE, "w") as f:
-        json.dump(list(hashes), f)
+        json.dump(list(old), f)
 
 def commit_cache():
-    """提交缓存文件到仓库，使用 [skip ci] 避免重复触发"""
     try:
         subprocess.run(["git", "config", "user.email", "actions@github.com"], check=False)
         subprocess.run(["git", "config", "user.name", "GitHub Actions"], check=False)
         subprocess.run(["git", "add", CACHE_FILE], check=False)
-        # 检查是否有变更
         result = subprocess.run(["git", "diff", "--cached", "--quiet"], capture_output=True)
         if result.returncode != 0:
             subprocess.run(["git", "commit", "-m", "Update pushed cache [skip ci]"], check=False)
@@ -126,23 +131,21 @@ def commit_cache():
     except Exception as e:
         logger.warning(f"提交缓存失败: {e}")
 
-# ========== 爬虫函数 ==========
+# ========== 爬虫 ==========
 def scrape_website(target: Dict) -> List[Dict]:
-    """轻量爬虫：抓取指定页面标题"""
     news = []
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         resp = requests.get(target["url"], headers=headers, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "lxml")
-        elements = soup.select(target["title_selector"])
-        for el in elements[:10]:  # 只取前10条
+        elements = soup.select(target["title_selector"])[:10]
+        for el in elements:
             title = el.get_text().strip()
             link = el.get(target["link_attr"], "")
             if link and target.get("base"):
                 if not link.startswith("http"):
                     link = target["base"].rstrip("/") + "/" + link.lstrip("/")
-            # 使用当前时间作为发布时间（爬虫无法精确获取）
             news.append({
                 "title": title,
                 "url": link,
@@ -156,7 +159,7 @@ def scrape_website(target: Dict) -> List[Dict]:
         logger.debug(f"爬虫失败 {target['url']}: {e}")
     return news
 
-# ========== 通用抓取与处理 ==========
+# ========== RSS抓取 ==========
 def fetch_rss(feed_info: Dict) -> List[Dict]:
     news = []
     try:
@@ -166,7 +169,6 @@ def fetch_rss(feed_info: Dict) -> List[Dict]:
         headers = {"User-Agent": "Mozilla/5.0"}
         resp = requests.get(full_url, headers=headers, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
-        # 特殊处理财联社API
         if "cls.cn" in url:
             try:
                 data = resp.json()
@@ -179,8 +181,8 @@ def fetch_rss(feed_info: Dict) -> List[Dict]:
                         if pub_time.strftime("%Y-%m-%d") != TODAY: continue
                         time_str = pub_time.strftime("%Y-%m-%d %H:%M")
                         summary = re.sub(r"<[^>]+>", "", art.get("brief", ""))[:200]
-                        item = {"title":title,"summary":summary,"source":"cls.cn","time":time_str,"category":feed_info["category"],"url":art.get("url","")}
-                        news.append(item)
+                        news.append({"title":title,"summary":summary,"source":"cls.cn","time":time_str,
+                                     "category":feed_info["category"],"url":art.get("url","")})
             except: pass
         else:
             feed = feedparser.parse(resp.content)
@@ -192,69 +194,65 @@ def fetch_rss(feed_info: Dict) -> List[Dict]:
                     pub_time = datetime(*entry.updated_parsed[:6], tzinfo=timezone.utc).astimezone(TZ_BEIJING)
                 if not pub_time: continue
                 time_str = pub_time.strftime("%Y-%m-%d %H:%M")
+                if TODAY not in time_str: continue
                 title = entry.get("title","").strip()
                 summary = re.sub(r"<[^>]+>", "", entry.get("summary",""))[:300].strip()
-                item = {"title":title,"summary":summary,"source":url.split("//")[-1].split("/")[0],"time":time_str,"category":feed_info["category"],"url":entry.get("link","")}
-                if TODAY in time_str:
-                    news.append(item)
+                news.append({"title":title,"summary":summary,"source":url.split("//")[-1].split("/")[0],
+                             "time":time_str,"category":feed_info["category"],"url":entry.get("link","")})
     except Exception as e:
         logger.debug(f"源 {url[:60]} 失败: {e}")
     return news
 
 def collect_all_news() -> Dict[str, List[Dict]]:
     pool = {}
-    # 1. RSS源
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(fetch_rss, f): f for f in RSS_FEEDS}
         for future in as_completed(futures):
             feed_info = futures[future]
-            cat = feed_info["category"]
             try:
                 result = future.result()
-                pool.setdefault(cat, []).extend(result)
+                pool.setdefault(feed_info["category"], []).extend(result)
             except Exception as e:
                 logger.warning(f"任务异常: {e}")
-    # 2. 爬虫
-    scraped_news = []
+    # 爬虫
     for target in SCRAPE_TARGETS:
-        scraped_news.extend(scrape_website(target))
-    for item in scraped_news:
-        pool.setdefault(item["category"], []).append(item)
+        items = scrape_website(target)
+        pool.setdefault(target["category"], []).extend(items)
     return pool
 
-# ========== 去重与精选（增加缓存过滤） ==========
-def deduplicate_strong(news_list: List[Dict], pushed_hashes: Set[str]) -> List[Dict]:
-    unique = []
-    seen = set(pushed_hashes)  # 从缓存中加载已推送哈希
-    for item in sorted(news_list, key=lambda x: x["time"], reverse=True):
-        h = hashlib.md5((item["title"] + item.get("url", "")).encode()).hexdigest()
-        if h in seen:
-            continue
-        if any(SequenceMatcher(None, item["title"], u["title"]).ratio() > 0.9 for u in unique):
-            continue
-        seen.add(h)
-        unique.append(item)
-    logger.info(f"去除已推送后剩余 {len(unique)} 条")
-    return unique
+# ========== 去重与精选（关键修改：不足时忽略缓存） ==========
+def generate_hash(item: Dict) -> str:
+    raw = item["title"] + item.get("url", "")
+    return hashlib.md5(raw.encode()).hexdigest() + f"@{TODAY}"
 
 def select_with_fallback(category_name: str, all_news: List[Dict], pushed_hashes: Set[str], target=5) -> List[Dict]:
-    news_list = deduplicate_strong(all_news, pushed_hashes)
-    if not news_list:
-        logger.warning(f"{category_name} 无新内容")
-        return []
+    # 先按时间排序
+    sorted_news = sorted(all_news, key=lambda x: x["time"], reverse=True)
+    # 第一次过滤：去除已推送（当天）
+    new_news = [item for item in sorted_news if generate_hash(item) not in pushed_hashes]
 
+    if len(new_news) >= target:
+        candidate = new_news
+        logger.info(f"{category_name} 有新内容 {len(new_news)} 条，正常选取")
+    else:
+        # 不足，忽略缓存，从全部新闻中选取（确保有内容）
+        candidate = sorted_news
+        logger.info(f"{category_name} 新内容不足，忽略缓存，从 {len(candidate)} 条中选取")
+
+    # 评分
     scores = KEYWORD_SCORES.get(category_name, {})
-    for item in news_list:
-        score = sum(v for k, v in scores.items() if k in item["title"])
-        item["_score"] = score
-    ranked = sorted(news_list, key=lambda x: (x["_score"], x["time"]), reverse=True)
+    for item in candidate:
+        item["_score"] = sum(v for k, v in scores.items() if k in item["title"])
+    ranked = sorted(candidate, key=lambda x: (x["_score"], x["time"]), reverse=True)
     selected = ranked[:target]
 
+    # 如果还不足，兜底关键词
     if len(selected) < target:
         fallback_kw = FALLBACK_KEYWORDS.get(category_name, [])
         supplement = [item for item in ranked if item not in selected and any(kw in item["title"] for kw in fallback_kw)]
         selected += supplement[:target-len(selected)]
 
+    # 仍不足，补最新
     if len(selected) < target:
         remaining = [item for item in ranked if item not in selected]
         selected += sorted(remaining, key=lambda x: x["time"], reverse=True)[:target-len(selected)]
@@ -262,13 +260,13 @@ def select_with_fallback(category_name: str, all_news: List[Dict], pushed_hashes
     return selected[:target]
 
 # ========== 翻译与AI摘要 ==========
-def is_english_text(text: str) -> bool:
+def is_english(text: str) -> bool:
     if not text: return False
     for ch in text:
         if '\u4e00' <= ch <= '\u9fff': return False
     return True
 
-def translate_text(text: str) -> str:
+def translate(text: str) -> str:
     if not LLM_API_KEY: return text
     try:
         prompt = f"将以下英文翻译成中文，只返回翻译结果：\n{text}"
@@ -277,19 +275,17 @@ def translate_text(text: str) -> str:
         resp = requests.post(f"{LLM_BASE_URL}/chat/completions", json=data, headers=headers, timeout=15)
         if resp.status_code != 200: return text
         return resp.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        logger.error(f"翻译异常: {e}")
-        return text
+    except: return text
 
 def translate_all(sections: Dict[str, List[Dict]]):
-    for sec, items in sections.items():
+    for items in sections.values():
         for item in items:
-            if is_english_text(item["title"]):
-                item["title"] = translate_text(item["title"])
-            if is_english_text(item["summary"]):
-                item["summary"] = translate_text(item["summary"])
+            if is_english(item["title"]):
+                item["title"] = translate(item["title"])
+            if is_english(item["summary"]):
+                item["summary"] = translate(item["summary"])
 
-def ai_summary_and_motto(sections: Dict[str, List[Dict]]) -> Dict:
+def ai_summary(sections: Dict[str, List[Dict]]) -> Dict:
     if not ENABLE_AI or not LLM_API_KEY: return {"intros":{}, "motto":""}
     try:
         all_titles = [f"[{sec}] {item['title']}" for sec, items in sections.items() for item in items]
@@ -304,8 +300,7 @@ def ai_summary_and_motto(sections: Dict[str, List[Dict]]) -> Dict:
                 "response_format":{"type":"json_object"}}
         resp = requests.post(f"{LLM_BASE_URL}/chat/completions", json=data, headers=headers, timeout=25)
         if resp.status_code == 200:
-            result = json.loads(resp.json()["choices"][0]["message"]["content"])
-            return {"intros": result.get("intros",{}), "motto": result.get("motto","")}
+            return json.loads(resp.json()["choices"][0]["message"]["content"])
     except Exception as e:
         logger.error(f"AI摘要失败: {e}")
     return {"intros":{}, "motto":""}
@@ -314,20 +309,24 @@ def format_daily(sections: Dict[str, List[Dict]], ai_extra: Dict) -> str:
     now = datetime.now(TZ_BEIJING)
     weekday = ["星期一","星期二","星期三","星期四","星期五","星期六","星期日"][now.weekday()]
     date_str = now.strftime("%Y年%m月%d日")
-    header = f"{date_str}日报，{weekday}，农历{get_lunar_date()}，工作愉快，生活喜乐！\n"
+    header = f"{date_str}日报，{weekday}，农历{ZhDate.from_datetime(now).chinese()}，工作愉快，生活喜乐！\n"
     order = ["国内新闻","国际新闻","湖北武汉本地动态","AI对普通人的影响","便利店行业动态","股票行业情报"]
     body = ""
+    has_any = False
     for sec in order:
         items = sections.get(sec, [])
         if not items:
-            body += f"\n【{sec}】今日无新内容\n"
+            body += f"\n【{sec}】今日暂无更新\n"
             continue
+        has_any = True
         intro = ai_extra.get("intros",{}).get(sec,"")
         body += f"\n━━━━━━ 【{sec}】━━━━━━\n"
         if intro: body += f"📌 {intro}\n"
         for i, item in enumerate(items, 1):
             body += f"{i}. {item['title']}\n"
         body += "\n"
+    if not has_any:
+        body += "\n⚠️ 今日所有分类均未获取到新闻，请检查网络或数据源。\n"
     motto = ai_extra.get("motto","")
     if motto: body += f"【微语】{motto}\n"
     return header + body
@@ -338,53 +337,35 @@ def push_wechat(content: str):
         "token": PUSHPLUS_TOKEN, "title": "每日日报", "content": content, "template": "txt"
     }, timeout=15).raise_for_status()
 
-def get_lunar_date():
-    return ZhDate.from_datetime(datetime.now()).chinese()
-
-# ========== 主流程 ==========
 def main():
-    # 加载已推送缓存
     pushed_hashes = load_pushed_hashes()
-    logger.info(f"已加载 {len(pushed_hashes)} 条推送记录")
+    logger.info(f"已加载今日推送哈希 {len(pushed_hashes)} 条")
 
-    # 收集所有新闻
     raw = collect_all_news()
     section_map = {
         "国内": "国内新闻", "国际": "国际新闻", "武汉": "湖北武汉本地动态",
         "AI": "AI对普通人的影响", "便利店": "便利店行业动态", "股票": "股票行业情报"
     }
-    sections = {v:[] for v in section_map.values()}
+    pool = {v:[] for v in section_map.values()}
     for cat, news in raw.items():
         sec = section_map.get(cat)
-        if sec: sections[sec].extend(news)
+        if sec: pool[sec].extend(news)
 
-    # 精选（包含去重）
     new_hashes = set()
-    final_sections = {}
-    for sec_name, all_news in sections.items():
+    final = {}
+    for sec_name, all_news in pool.items():
         selected = select_with_fallback(sec_name, all_news, pushed_hashes)
-        final_sections[sec_name] = selected
+        final[sec_name] = selected
         for item in selected:
-            h = hashlib.md5((item["title"] + item.get("url", "")).encode()).hexdigest()
-            new_hashes.add(h)
+            new_hashes.add(generate_hash(item))
         logger.info(f"{sec_name}: 推送 {len(selected)} 条")
 
-    # 翻译
-    translate_all(final_sections)
-    # AI摘要
-    ai_extra = ai_summary_and_motto(final_sections)
-    # 格式化
-    msg = format_daily(final_sections, ai_extra)
-    # 推送
-    if any(items for items in final_sections.values()):
-        push_wechat(msg)
-        logger.info("推送成功")
-    else:
-        logger.info("无新内容，不推送")
+    translate_all(final)
+    ai_extra = ai_summary(final)
+    msg = format_daily(final, ai_extra)
+    push_wechat(msg)
 
-    # 更新缓存并提交
-    pushed_hashes.update(new_hashes)
-    save_pushed_hashes(pushed_hashes)
+    save_pushed_hashes(new_hashes)
     commit_cache()
 
 if __name__ == "__main__":

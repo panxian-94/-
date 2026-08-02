@@ -2,29 +2,31 @@ name: Daily News Digest
 
 on:
   schedule:
-    # 北京时间每天早上6点（UTC前一日22:00）
-    - cron: '0 22 * * *'
+    - cron: '0 22 * * *'   # 北京时间早6点
   workflow_dispatch:
+
+permissions:
+  contents: write   # 允许提交
 
 jobs:
   send-news:
     runs-on: ubuntu-latest
-
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true   # 保留认证信息，用于后续 git push
 
-      - name: 设置 Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 安装依赖
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 运行新闻推送脚本
+      - name: Run news digest
         env:
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}

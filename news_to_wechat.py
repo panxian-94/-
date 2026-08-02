@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-日报推送（6分类版）：国内、国际、武汉本地、AI影响、便利店、股票
-智谱AI免费翻译+摘要，确保每个分类均有新闻
+超级日报推送：抖音/小红书/公众号/Reddit 等全平台覆盖
+智谱AI免费翻译+摘要，6大分类，每类5条，共30条
 """
 
 import os, sys, time, hashlib, logging, requests, feedparser, re, json
@@ -15,10 +15,10 @@ from zhdate import ZhDate
 PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "")
 TZ_BEIJING = timezone(timedelta(hours=8))
 TODAY = datetime.now(TZ_BEIJING).strftime("%Y-%m-%d")
-MAX_WORKERS = 10
-REQUEST_TIMEOUT = 12
+MAX_WORKERS = 12
+REQUEST_TIMEOUT = 15
 
-# AI 配置（智谱免费模型）
+# 智谱AI
 ENABLE_AI = os.environ.get("ENABLE_AI_SUMMARY", "true").lower() == "true"
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
@@ -27,18 +27,19 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "glm-4-flash")
 logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-# ---------- 多源 RSS 定义（已分类）----------
+# ========== 超级 RSS 源列表 ==========
 RSS_FEEDS = [
-    # ====== 国内新闻 ======
+    # ---------- 国内新闻 ----------
     {"url": "http://www.xinhuanet.com/politics/xhsll.xml", "category": "国内"},
     {"url": "http://www.people.com.cn/rss/politics.xml", "category": "国内"},
     {"url": "https://www.chinanews.com/rss/rss_1.html", "category": "国内"},
     {"url": "https://www.thepaper.cn/rss_news_1.xml", "category": "国内"},
     {"url": "https://news.sina.com.cn/rss/1.xml", "category": "国内"},
     {"url": "https://news.163.com/special/002341KK/rss_news.xml", "category": "国内"},
+    # 百度新闻聚合（国内综合）
     {"url": "https://news.baidu.com/ns?word=%E4%B8%AD%E5%9B%BD+%E7%BB%8F%E6%B5%8E+%E6%B0%91%E7%94%9F&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "国内"},
 
-    # ====== 国际新闻 ======
+    # ---------- 国际新闻 ----------
     {"url": "https://feeds.bbci.co.uk/news/world/rss.xml", "category": "国际"},
     {"url": "https://www.chinadaily.com.cn/rss/world_rss.xml", "category": "国际"},
     {"url": "https://www.aljazeera.com/xml/rss/all.xml", "category": "国际"},
@@ -46,53 +47,73 @@ RSS_FEEDS = [
     {"url": "https://news.google.com/rss?hl=zh-CN&gl=CN&ceid=CN:zh-Hans", "category": "国际"},
     {"url": "https://news.baidu.com/ns?word=%E5%9B%BD%E9%99%85+%E7%BE%8E%E5%9B%BD+%E6%AC%A7%E6%B4%B2&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "国际"},
 
-    # ====== 湖北武汉本地 ======
+    # ---------- 湖北武汉本地 ----------
     {"url": "http://www.cnhubei.com/rss/whxw.xml", "category": "武汉"},
     {"url": "http://www.changjiangtimes.com/rss/wh.xml", "category": "武汉"},
     {"url": "http://hb.people.com.cn/rss/hubei.xml", "category": "武汉"},
     {"url": "http://www.hb.chinanews.com/rss/hubei.xml", "category": "武汉"},
-    {"url": "http://www.wuhan.gov.cn/site/rss/whxw.xml", "category": "武汉"},  # 武汉市政府
+    {"url": "http://www.wuhan.gov.cn/site/rss/whxw.xml", "category": "武汉"},
     {"url": "https://news.baidu.com/ns?word=%E6%AD%A6%E6%B1%89+%E6%B9%96%E5%8C%97+%E5%9C%B0%E9%93%81+%E5%A4%A9%E6%B0%94&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "武汉"},
 
-    # ====== AI 影响（侧重国内）======
+    # ---------- AI 影响（侧重国内）----------
     {"url": "https://www.36kr.com/feed", "category": "AI"},
     {"url": "https://www.huxiu.com/rss/0.html", "category": "AI"},
     {"url": "https://www.technologyreview.com/feed/", "category": "AI"},
     {"url": "https://news.baidu.com/ns?word=%E4%BA%BA%E5%B7%A5%E6%99%BA%E8%83%BD+AI+%E5%A4%A7%E6%A8%A1%E5%9E%8B+%E6%99%BA%E8%83%BD&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "AI"},
 
-    # ====== 便利店行业动态 ======
+    # ---------- 便利店行业动态 ----------
     {"url": "https://news.baidu.com/ns?word=%E4%BE%BF%E5%88%A9%E5%BA%97+%E9%9B%B6%E5%94%AE+%E5%BF%AB%E6%B6%88+%E4%BE%9B%E5%BA%94%E9%93%BE&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "便利店"},
-    {"url": "https://www.linkshop.com/rss/news.xml", "category": "便利店"},  # 联商网（零售业）
-    # 通用零售财经源
-    {"url": "https://www.cls.cn/api/sw?app=CailianpressWeb&os=web&sv=8.4.6", "category": "便利店"},
+    {"url": "https://www.linkshop.com/rss/news.xml", "category": "便利店"},
 
-    # ====== 股票行业情报 ======
+    # ---------- 股票行业情报 ----------
     {"url": "https://news.baidu.com/ns?word=%E8%82%A1%E5%B8%82+%E9%9B%B6%E5%94%AE+%E6%B6%88%E8%B4%B9+%E5%AE%8F%E8%A7%82%E7%BB%8F%E6%B5%8E&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "股票"},
-    {"url": "https://www.cls.cn/api/sw?app=CailianpressWeb&os=web&sv=8.4.6", "category": "股票"},  # 财联社重复利用
-    {"url": "https://stock.10jqka.com.cn/rss/index.shtml", "category": "股票"},  # 同花顺
+    {"url": "https://www.cls.cn/api/sw?app=CailianpressWeb&os=web&sv=8.4.6", "category": "股票"},
+
+    # ===== 新增：社交媒体和流量平台 =====
+    # 抖音热门（百度新闻聚合）
+    {"url": "https://news.baidu.com/ns?word=%E6%8A%96%E9%9F%B3+%E7%83%AD%E6%90%9C&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "国内"},
+    # 小红书热门
+    {"url": "https://news.baidu.com/ns?word=%E5%B0%8F%E7%BA%A2%E4%B9%A6+%E7%83%AD%E9%97%A8&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "国内"},
+    # 微信公众号热文
+    {"url": "https://news.baidu.com/ns?word=%E5%BE%AE%E4%BF%A1%E5%85%AC%E4%BC%97%E5%8F%B7+%E7%83%AD%E6%96%87&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "国内"},
+    # 微博热搜
+    {"url": "https://news.baidu.com/ns?word=%E5%BE%AE%E5%8D%9A%E7%83%AD%E6%90%9C+%E8%AF%9D%E9%A2%98&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "国内"},
+    # 知乎热榜
+    {"url": "https://news.baidu.com/ns?word=%E7%9F%A5%E4%B9%8E+%E7%83%AD%E6%A6%9C&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "国内"},
+    # 百度贴吧热议
+    {"url": "https://news.baidu.com/ns?word=%E8%B4%B4%E5%90%A7+%E7%83%AD%E8%AE%AE&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "国内"},
+
+    # 国外平台：Reddit、Twitter 等（通过 RSSHub 公共实例）
+    # Reddit 热门（r/all）
+    {"url": "https://rsshub.app/reddit/all", "category": "国际"},
+    # Twitter（X）用户推文（以 Elon Musk 为例，可自行更换）
+    {"url": "https://rsshub.app/twitter/user/elonmusk", "category": "国际"},
+    # Telegram 频道（示例：每日新闻频道）
+    {"url": "https://rsshub.app/telegram/channel/tnews365", "category": "国际"},
+    # 如果上面失效，备选另一个RSSHub实例
+    {"url": "https://rsshub.rssforever.com/reddit/all", "category": "国际"},
 ]
 
 # ---------- 关键词评分表 ----------
 KEYWORD_SCORES = {
-    "国内新闻": {"中国":10, "国内":10, "经济":5, "就业":5, "CPI":5, "房贷":5, "利率":5, "医保":4, "社保":4, "交通":4, "天气":4, "预警":4, "政策":5, "人民币":5},
-    "国际新闻": {"美国":10, "欧洲":10, "日本":10, "俄罗斯":10, "中东":10, "美联储":5, "汇率":5, "油价":5, "芯片":5, "全球":4},
-    "湖北武汉本地动态": {"武汉":10, "湖北":10, "施工":5, "地铁":5, "暴雨":5, "高温":5, "消费券":5, "烟草":5, "罗森":5},
-    "AI对普通人的影响": {"AI":10, "人工智能":10, "ChatGPT":10, "大模型":5, "替代":5, "职业":5, "监管":5, "国内":8, "中国":8},
-    "便利店行业动态": {"便利店":10, "零售":8, "快消":8, "供应链":5, "加盟":5, "鲜食":5, "罗森":8, "7-11":8, "全家":8, "新开店":5},
-    "股票行业情报": {"A股":10, "指数":8, "板块":8, "零售":5, "消费":5, "券商":5, "研报":5, "政策":5, "利率":5, "上市公司":5},
+    "国内新闻": {"中国":10,"国内":10,"抖音":8,"小红书":8,"公众号":8,"微博":8,"知乎":8,"经济":5,"就业":5},
+    "国际新闻": {"美国":10,"欧洲":10,"日本":10,"俄罗斯":10,"Reddit":8,"Twitter":8,"美联储":5,"汇率":5},
+    "湖北武汉本地动态": {"武汉":10,"湖北":10,"施工":5,"地铁":5,"暴雨":5,"高温":5,"消费券":5,"烟草":5,"罗森":5},
+    "AI对普通人的影响": {"AI":10,"人工智能":10,"ChatGPT":10,"大模型":5,"替代":5,"职业":5,"国内":8,"中国":8},
+    "便利店行业动态": {"便利店":10,"零售":8,"快消":8,"供应链":5,"加盟":5,"鲜食":5,"罗森":8,"7-11":8,"全家":8},
+    "股票行业情报": {"A股":10,"指数":8,"板块":8,"零售":5,"消费":5,"券商":5,"研报":5,"利率":5,"上市公司":5},
 }
 
-# 兜底关键词（分类不够时使用）
 FALLBACK_KEYWORDS = {
-    "国内新闻": ["中国", "国内", "经济", "政策", "社会"],
-    "国际新闻": ["美国", "欧洲", "国际", "全球"],
-    "湖北武汉本地动态": ["武汉", "湖北"],
-    "AI对普通人的影响": ["人工智能", "AI", "智能"],
-    "便利店行业动态": ["零售", "便利店", "超市"],
-    "股票行业情报": ["股市", "A股", "股票"],
+    "国内新闻": ["中国","国内","经济","政策","社会"],
+    "国际新闻": ["美国","欧洲","国际","全球"],
+    "湖北武汉本地动态": ["武汉","湖北"],
+    "AI对普通人的影响": ["人工智能","AI","智能"],
+    "便利店行业动态": ["零售","便利店","超市"],
+    "股票行业情报": ["股市","A股","股票"],
 }
 
-# ---------- 工具函数（与之前类似，略作调整）----------
+# ---------- 工具函数 ----------
 def get_lunar_date():
     return ZhDate.from_datetime(datetime.now()).chinese()
 
@@ -129,7 +150,7 @@ def fetch_rss(feed_info: Dict) -> List[Dict]:
         headers = {"User-Agent": "Mozilla/5.0"}
         resp = requests.get(full_url, headers=headers, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
-        # 特殊处理财联社API
+        # 财联社API特殊处理
         if "cls.cn" in url:
             try:
                 data = resp.json()
@@ -142,10 +163,9 @@ def fetch_rss(feed_info: Dict) -> List[Dict]:
                         if pub_time.strftime("%Y-%m-%d") != TODAY: continue
                         time_str = pub_time.strftime("%Y-%m-%d %H:%M")
                         summary = re.sub(r"<[^>]+>", "", art.get("brief", ""))[:200]
-                        item = {"title": title, "summary": summary, "source": "cls.cn", "time": time_str, "category": feed_info["category"], "url": art.get("url","")}
+                        item = {"title":title,"summary":summary,"source":"cls.cn","time":time_str,"category":feed_info["category"],"url":art.get("url","")}
                         news.append(item)
-            except:
-                pass
+            except: pass
         else:
             feed = feedparser.parse(resp.content)
             for entry in feed.entries:
@@ -156,9 +176,9 @@ def fetch_rss(feed_info: Dict) -> List[Dict]:
                     pub_time = datetime(*entry.updated_parsed[:6], tzinfo=timezone.utc).astimezone(TZ_BEIJING)
                 if not pub_time: continue
                 time_str = pub_time.strftime("%Y-%m-%d %H:%M")
-                title = entry.get("title", "").strip()
-                summary = re.sub(r"<[^>]+>", "", entry.get("summary", ""))[:300].strip()
-                item = {"title": title, "summary": summary, "source": url.split("//")[-1].split("/")[0], "time": time_str, "category": feed_info["category"], "url": entry.get("link","")}
+                title = entry.get("title","").strip()
+                summary = re.sub(r"<[^>]+>", "", entry.get("summary",""))[:300].strip()
+                item = {"title":title,"summary":summary,"source":url.split("//")[-1].split("/")[0],"time":time_str,"category":feed_info["category"],"url":entry.get("link","")}
                 if validate_today(item):
                     news.append(item)
     except Exception as e:
@@ -212,11 +232,6 @@ def select_with_fallback(category_name: str, all_news: List[Dict], target=5) -> 
         remaining = [item for item in ranked if item not in selected]
         selected += sorted(remaining, key=lambda x: x["time"], reverse=True)[:target-len(selected)]
 
-    # 简单信源标注（可选）
-    for item in selected:
-        if item.get("source", "") not in ["xinhuanet.com","people.com.cn","chinanews.com","cctv.com","cls.cn"]:
-            if "[信源待核实]" not in item["title"]:
-                item["title"] += " [信源待核实]"
     return selected[:target]
 
 def is_english_text(text: str) -> bool:
@@ -296,7 +311,7 @@ def push_wechat(content: str):
     }, timeout=15).raise_for_status()
 
 def main():
-    logger.info("开始多源新闻抓取...")
+    logger.info("超级日报抓取启动...")
     raw = collect_all_news()
     section_map = {
         "国内": "国内新闻", "国际": "国际新闻", "武汉": "湖北武汉本地动态",

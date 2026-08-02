@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-超级日报推送：抖音/小红书/公众号/Reddit 等全平台覆盖
-智谱AI免费翻译+摘要，6大分类，每类5条，共30条
+超级日报（增强版）：爬虫+社交媒体聚合+缓存去重
+智谱AI翻译+摘要，6分类每类5条，全自动去重
 """
 
-import os, sys, time, hashlib, logging, requests, feedparser, re, json
+import os, sys, time, hashlib, logging, requests, feedparser, re, json, subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from difflib import SequenceMatcher
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
+from bs4 import BeautifulSoup
 from zhdate import ZhDate
 
 # ---------- 配置 ----------
@@ -18,7 +19,11 @@ TODAY = datetime.now(TZ_BEIJING).strftime("%Y-%m-%d")
 MAX_WORKERS = 12
 REQUEST_TIMEOUT = 15
 
-# 智谱AI
+# 缓存文件路径
+CACHE_DIR = "cache"
+CACHE_FILE = os.path.join(CACHE_DIR, "pushed_hashes.json")
+
+# AI 配置（智谱免费模型）
 ENABLE_AI = os.environ.get("ENABLE_AI_SUMMARY", "true").lower() == "true"
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
@@ -27,78 +32,55 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "glm-4-flash")
 logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-# ========== 超级 RSS 源列表 ==========
+# ========== 1. 原有RSS源 + 社交媒体搜索聚合源 ==========
 RSS_FEEDS = [
-    # ---------- 国内新闻 ----------
+    # 国内新闻（传统源）
     {"url": "http://www.xinhuanet.com/politics/xhsll.xml", "category": "国内"},
     {"url": "http://www.people.com.cn/rss/politics.xml", "category": "国内"},
     {"url": "https://www.chinanews.com/rss/rss_1.html", "category": "国内"},
     {"url": "https://www.thepaper.cn/rss_news_1.xml", "category": "国内"},
-    {"url": "https://news.sina.com.cn/rss/1.xml", "category": "国内"},
-    {"url": "https://news.163.com/special/002341KK/rss_news.xml", "category": "国内"},
-    # 百度新闻聚合（国内综合）
+    # 百度聚合（国内综合）
     {"url": "https://news.baidu.com/ns?word=%E4%B8%AD%E5%9B%BD+%E7%BB%8F%E6%B5%8E+%E6%B0%91%E7%94%9F&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "国内"},
-
-    # ---------- 国际新闻 ----------
+    # 社交媒体关键词聚合：抖音、小红书、公众号、微博、知乎
+    {"url": "https://news.baidu.com/ns?word=%E6%8A%96%E9%9F%B3+%E7%83%AD%E6%90%9C&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "国内"},
+    {"url": "https://news.baidu.com/ns?word=%E5%B0%8F%E7%BA%A2%E4%B9%A6+%E7%83%AD%E9%97%A8&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "国内"},
+    {"url": "https://news.baidu.com/ns?word=%E5%BE%AE%E4%BF%A1%E5%85%AC%E4%BC%97%E5%8F%B7+%E7%83%AD%E6%96%87&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "国内"},
+    {"url": "https://news.baidu.com/ns?word=%E5%BE%AE%E5%8D%9A%E7%83%AD%E6%90%9C&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "国内"},
+    {"url": "https://news.baidu.com/ns?word=%E7%9F%A5%E4%B9%8E+%E7%83%AD%E6%A6%9C&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "国内"},
+    # 国际新闻
     {"url": "https://feeds.bbci.co.uk/news/world/rss.xml", "category": "国际"},
     {"url": "https://www.chinadaily.com.cn/rss/world_rss.xml", "category": "国际"},
-    {"url": "https://www.aljazeera.com/xml/rss/all.xml", "category": "国际"},
-    {"url": "https://www.reuters.com/tools/rss", "category": "国际"},
-    {"url": "https://news.google.com/rss?hl=zh-CN&gl=CN&ceid=CN:zh-Hans", "category": "国际"},
     {"url": "https://news.baidu.com/ns?word=%E5%9B%BD%E9%99%85+%E7%BE%8E%E5%9B%BD+%E6%AC%A7%E6%B4%B2&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "国际"},
-
-    # ---------- 湖北武汉本地 ----------
+    # 武汉本地
     {"url": "http://www.cnhubei.com/rss/whxw.xml", "category": "武汉"},
-    {"url": "http://www.changjiangtimes.com/rss/wh.xml", "category": "武汉"},
     {"url": "http://hb.people.com.cn/rss/hubei.xml", "category": "武汉"},
-    {"url": "http://www.hb.chinanews.com/rss/hubei.xml", "category": "武汉"},
-    {"url": "http://www.wuhan.gov.cn/site/rss/whxw.xml", "category": "武汉"},
     {"url": "https://news.baidu.com/ns?word=%E6%AD%A6%E6%B1%89+%E6%B9%96%E5%8C%97+%E5%9C%B0%E9%93%81+%E5%A4%A9%E6%B0%94&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "武汉"},
-
-    # ---------- AI 影响（侧重国内）----------
+    # AI 影响
     {"url": "https://www.36kr.com/feed", "category": "AI"},
     {"url": "https://www.huxiu.com/rss/0.html", "category": "AI"},
-    {"url": "https://www.technologyreview.com/feed/", "category": "AI"},
-    {"url": "https://news.baidu.com/ns?word=%E4%BA%BA%E5%B7%A5%E6%99%BA%E8%83%BD+AI+%E5%A4%A7%E6%A8%A1%E5%9E%8B+%E6%99%BA%E8%83%BD&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "AI"},
-
-    # ---------- 便利店行业动态 ----------
-    {"url": "https://news.baidu.com/ns?word=%E4%BE%BF%E5%88%A9%E5%BA%97+%E9%9B%B6%E5%94%AE+%E5%BF%AB%E6%B6%88+%E4%BE%9B%E5%BA%94%E9%93%BE&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "便利店"},
-    {"url": "https://www.linkshop.com/rss/news.xml", "category": "便利店"},
-
-    # ---------- 股票行业情报 ----------
-    {"url": "https://news.baidu.com/ns?word=%E8%82%A1%E5%B8%82+%E9%9B%B6%E5%94%AE+%E6%B6%88%E8%B4%B9+%E5%AE%8F%E8%A7%82%E7%BB%8F%E6%B5%8E&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "股票"},
+    {"url": "https://news.baidu.com/ns?word=%E4%BA%BA%E5%B7%A5%E6%99%BA%E8%83%BD+AI+%E5%A4%A7%E6%A8%A1%E5%9E%8B&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "AI"},
+    # 便利店行业
+    {"url": "https://news.baidu.com/ns?word=%E4%BE%BF%E5%88%A9%E5%BA%97+%E9%9B%B6%E5%94%AE+%E5%BF%AB%E6%B6%88&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "便利店"},
+    # 股票情报
     {"url": "https://www.cls.cn/api/sw?app=CailianpressWeb&os=web&sv=8.4.6", "category": "股票"},
-
-    # ===== 新增：社交媒体和流量平台 =====
-    # 抖音热门（百度新闻聚合）
-    {"url": "https://news.baidu.com/ns?word=%E6%8A%96%E9%9F%B3+%E7%83%AD%E6%90%9C&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "国内"},
-    # 小红书热门
-    {"url": "https://news.baidu.com/ns?word=%E5%B0%8F%E7%BA%A2%E4%B9%A6+%E7%83%AD%E9%97%A8&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "国内"},
-    # 微信公众号热文
-    {"url": "https://news.baidu.com/ns?word=%E5%BE%AE%E4%BF%A1%E5%85%AC%E4%BC%97%E5%8F%B7+%E7%83%AD%E6%96%87&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "国内"},
-    # 微博热搜
-    {"url": "https://news.baidu.com/ns?word=%E5%BE%AE%E5%8D%9A%E7%83%AD%E6%90%9C+%E8%AF%9D%E9%A2%98&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "国内"},
-    # 知乎热榜
-    {"url": "https://news.baidu.com/ns?word=%E7%9F%A5%E4%B9%8E+%E7%83%AD%E6%A6%9C&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "国内"},
-    # 百度贴吧热议
-    {"url": "https://news.baidu.com/ns?word=%E8%B4%B4%E5%90%A7+%E7%83%AD%E8%AE%AE&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "国内"},
-
-    # 国外平台：Reddit、Twitter 等（通过 RSSHub 公共实例）
-    # Reddit 热门（r/all）
-    {"url": "https://rsshub.app/reddit/all", "category": "国际"},
-    # Twitter（X）用户推文（以 Elon Musk 为例，可自行更换）
-    {"url": "https://rsshub.app/twitter/user/elonmusk", "category": "国际"},
-    # Telegram 频道（示例：每日新闻频道）
-    {"url": "https://rsshub.app/telegram/channel/tnews365", "category": "国际"},
-    # 如果上面失效，备选另一个RSSHub实例
-    {"url": "https://rsshub.rssforever.com/reddit/all", "category": "国际"},
+    {"url": "https://news.baidu.com/ns?word=%E8%82%A1%E5%B8%82+%E9%9B%B6%E5%94%AE+%E6%B6%88%E8%B4%B9+%E5%AE%8F%E8%A7%82%E7%BB%8F%E6%B5%8E&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "股票"},
 ]
 
-# ---------- 关键词评分表 ----------
+# ========== 2. 网页爬虫目标 ==========
+SCRAPE_TARGETS = [
+    # 便利店相关
+    {"url": "http://www.linkshop.com/news/", "category": "便利店",
+     "title_selector": "div.newslist ul li a", "link_attr": "href", "base": "http://www.linkshop.com"},
+    # 武汉政府公告
+    {"url": "http://www.wuhan.gov.cn/sy/whyw/", "category": "武汉",
+     "title_selector": "ul.list li a", "link_attr": "href", "base": "http://www.wuhan.gov.cn"},
+]
+
+# ========== 关键词评分表 ==========
 KEYWORD_SCORES = {
     "国内新闻": {"中国":10,"国内":10,"抖音":8,"小红书":8,"公众号":8,"微博":8,"知乎":8,"经济":5,"就业":5},
-    "国际新闻": {"美国":10,"欧洲":10,"日本":10,"俄罗斯":10,"Reddit":8,"Twitter":8,"美联储":5,"汇率":5},
-    "湖北武汉本地动态": {"武汉":10,"湖北":10,"施工":5,"地铁":5,"暴雨":5,"高温":5,"消费券":5,"烟草":5,"罗森":5},
+    "国际新闻": {"美国":10,"欧洲":10,"日本":10,"俄罗斯":10,"美联储":5,"汇率":5,"油价":5,"芯片":5},
+    "湖北武汉本地动态": {"武汉":10,"湖北":10,"施工":5,"地铁":5,"暴雨":5,"高温":5,"消费券":5,"烟草":5},
     "AI对普通人的影响": {"AI":10,"人工智能":10,"ChatGPT":10,"大模型":5,"替代":5,"职业":5,"国内":8,"中国":8},
     "便利店行业动态": {"便利店":10,"零售":8,"快消":8,"供应链":5,"加盟":5,"鲜食":5,"罗森":8,"7-11":8,"全家":8},
     "股票行业情报": {"A股":10,"指数":8,"板块":8,"零售":5,"消费":5,"券商":5,"研报":5,"利率":5,"上市公司":5},
@@ -113,34 +95,68 @@ FALLBACK_KEYWORDS = {
     "股票行业情报": ["股市","A股","股票"],
 }
 
-# ---------- 工具函数 ----------
-def get_lunar_date():
-    return ZhDate.from_datetime(datetime.now()).chinese()
+# ========== 缓存去重 ==========
+def load_pushed_hashes() -> Set[str]:
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, "r") as f:
+                return set(json.load(f))
+    except:
+        pass
+    return set()
 
-def extract_date_from_text(text: str) -> Optional[str]:
-    patterns = [r'(\d{4}-\d{2}-\d{2})', r'(\d{4}年\d{1,2}月\d{1,2}日)']
-    for pat in patterns:
-        match = re.search(pat, text)
-        if match:
-            date_str = match.group(1).replace('年','-').replace('月','-').replace('日','')
-            try:
-                datetime.strptime(date_str, "%Y-%m-%d")
-                return date_str
-            except:
-                continue
-    return None
+def save_pushed_hashes(hashes: Set[str]):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(CACHE_FILE, "w") as f:
+        json.dump(list(hashes), f)
 
-def validate_today(item: Dict) -> bool:
-    if item.get("time") and TODAY not in item["time"]:
-        return False
-    if item.get("url"):
-        if extract_date_from_text(item["url"]) not in (None, TODAY):
-            return False
-    if item.get("title"):
-        if extract_date_from_text(item["title"]) not in (None, TODAY):
-            return False
-    return True
+def commit_cache():
+    """提交缓存文件到仓库，使用 [skip ci] 避免重复触发"""
+    try:
+        subprocess.run(["git", "config", "user.email", "actions@github.com"], check=False)
+        subprocess.run(["git", "config", "user.name", "GitHub Actions"], check=False)
+        subprocess.run(["git", "add", CACHE_FILE], check=False)
+        # 检查是否有变更
+        result = subprocess.run(["git", "diff", "--cached", "--quiet"], capture_output=True)
+        if result.returncode != 0:
+            subprocess.run(["git", "commit", "-m", "Update pushed cache [skip ci]"], check=False)
+            subprocess.run(["git", "push"], check=False)
+            logger.info("缓存已更新并推送")
+    except Exception as e:
+        logger.warning(f"提交缓存失败: {e}")
 
+# ========== 爬虫函数 ==========
+def scrape_website(target: Dict) -> List[Dict]:
+    """轻量爬虫：抓取指定页面标题"""
+    news = []
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(target["url"], headers=headers, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "lxml")
+        elements = soup.select(target["title_selector"])
+        for el in elements[:10]:  # 只取前10条
+            title = el.get_text().strip()
+            link = el.get(target["link_attr"], "")
+            if link and target.get("base"):
+                if not link.startswith("http"):
+                    link = target["base"].rstrip("/") + "/" + link.lstrip("/")
+            # 使用当前时间作为发布时间（爬虫无法精确获取）
+            news.append({
+                "title": title,
+                "url": link,
+                "summary": "",
+                "source": target["url"].split("//")[-1].split("/")[0],
+                "time": datetime.now(TZ_BEIJING).strftime("%Y-%m-%d %H:%M"),
+                "category": target["category"],
+            })
+        logger.info(f"爬虫 {target['url']} 获取 {len(news)} 条")
+    except Exception as e:
+        logger.debug(f"爬虫失败 {target['url']}: {e}")
+    return news
+
+# ========== 通用抓取与处理 ==========
 def fetch_rss(feed_info: Dict) -> List[Dict]:
     news = []
     try:
@@ -150,7 +166,7 @@ def fetch_rss(feed_info: Dict) -> List[Dict]:
         headers = {"User-Agent": "Mozilla/5.0"}
         resp = requests.get(full_url, headers=headers, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
-        # 财联社API特殊处理
+        # 特殊处理财联社API
         if "cls.cn" in url:
             try:
                 data = resp.json()
@@ -179,7 +195,7 @@ def fetch_rss(feed_info: Dict) -> List[Dict]:
                 title = entry.get("title","").strip()
                 summary = re.sub(r"<[^>]+>", "", entry.get("summary",""))[:300].strip()
                 item = {"title":title,"summary":summary,"source":url.split("//")[-1].split("/")[0],"time":time_str,"category":feed_info["category"],"url":entry.get("link","")}
-                if validate_today(item):
+                if TODAY in time_str:
                     news.append(item)
     except Exception as e:
         logger.debug(f"源 {url[:60]} 失败: {e}")
@@ -187,6 +203,7 @@ def fetch_rss(feed_info: Dict) -> List[Dict]:
 
 def collect_all_news() -> Dict[str, List[Dict]]:
     pool = {}
+    # 1. RSS源
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(fetch_rss, f): f for f in RSS_FEEDS}
         for future in as_completed(futures):
@@ -197,22 +214,34 @@ def collect_all_news() -> Dict[str, List[Dict]]:
                 pool.setdefault(cat, []).extend(result)
             except Exception as e:
                 logger.warning(f"任务异常: {e}")
+    # 2. 爬虫
+    scraped_news = []
+    for target in SCRAPE_TARGETS:
+        scraped_news.extend(scrape_website(target))
+    for item in scraped_news:
+        pool.setdefault(item["category"], []).append(item)
     return pool
 
-def deduplicate_strong(news_list: List[Dict]) -> List[Dict]:
+# ========== 去重与精选（增加缓存过滤） ==========
+def deduplicate_strong(news_list: List[Dict], pushed_hashes: Set[str]) -> List[Dict]:
     unique = []
-    seen = set()
+    seen = set(pushed_hashes)  # 从缓存中加载已推送哈希
     for item in sorted(news_list, key=lambda x: x["time"], reverse=True):
-        h = hashlib.md5(item["title"].encode()).hexdigest()
-        if h in seen: continue
-        if any(SequenceMatcher(None, item["title"], u["title"]).ratio() > 0.9 for u in unique): continue
+        h = hashlib.md5((item["title"] + item.get("url", "")).encode()).hexdigest()
+        if h in seen:
+            continue
+        if any(SequenceMatcher(None, item["title"], u["title"]).ratio() > 0.9 for u in unique):
+            continue
         seen.add(h)
         unique.append(item)
+    logger.info(f"去除已推送后剩余 {len(unique)} 条")
     return unique
 
-def select_with_fallback(category_name: str, all_news: List[Dict], target=5) -> List[Dict]:
-    news_list = deduplicate_strong(all_news)
-    logger.info(f"{category_name} 去重后共 {len(news_list)} 条")
+def select_with_fallback(category_name: str, all_news: List[Dict], pushed_hashes: Set[str], target=5) -> List[Dict]:
+    news_list = deduplicate_strong(all_news, pushed_hashes)
+    if not news_list:
+        logger.warning(f"{category_name} 无新内容")
+        return []
 
     scores = KEYWORD_SCORES.get(category_name, {})
     for item in news_list:
@@ -222,18 +251,17 @@ def select_with_fallback(category_name: str, all_news: List[Dict], target=5) -> 
     selected = ranked[:target]
 
     if len(selected) < target:
-        logger.info(f"{category_name} 不足，使用兜底关键词扩大范围...")
         fallback_kw = FALLBACK_KEYWORDS.get(category_name, [])
         supplement = [item for item in ranked if item not in selected and any(kw in item["title"] for kw in fallback_kw)]
         selected += supplement[:target-len(selected)]
 
     if len(selected) < target:
-        logger.info(f"{category_name} 仍不足，从剩余最新新闻中补足...")
         remaining = [item for item in ranked if item not in selected]
         selected += sorted(remaining, key=lambda x: x["time"], reverse=True)[:target-len(selected)]
 
     return selected[:target]
 
+# ========== 翻译与AI摘要 ==========
 def is_english_text(text: str) -> bool:
     if not text: return False
     for ch in text:
@@ -292,7 +320,7 @@ def format_daily(sections: Dict[str, List[Dict]], ai_extra: Dict) -> str:
     for sec in order:
         items = sections.get(sec, [])
         if not items:
-            body += f"\n【{sec}】今日该类热点较少\n"
+            body += f"\n【{sec}】今日无新内容\n"
             continue
         intro = ai_extra.get("intros",{}).get(sec,"")
         body += f"\n━━━━━━ 【{sec}】━━━━━━\n"
@@ -310,8 +338,16 @@ def push_wechat(content: str):
         "token": PUSHPLUS_TOKEN, "title": "每日日报", "content": content, "template": "txt"
     }, timeout=15).raise_for_status()
 
+def get_lunar_date():
+    return ZhDate.from_datetime(datetime.now()).chinese()
+
+# ========== 主流程 ==========
 def main():
-    logger.info("超级日报抓取启动...")
+    # 加载已推送缓存
+    pushed_hashes = load_pushed_hashes()
+    logger.info(f"已加载 {len(pushed_hashes)} 条推送记录")
+
+    # 收集所有新闻
     raw = collect_all_news()
     section_map = {
         "国内": "国内新闻", "国际": "国际新闻", "武汉": "湖北武汉本地动态",
@@ -322,14 +358,34 @@ def main():
         sec = section_map.get(cat)
         if sec: sections[sec].extend(news)
 
+    # 精选（包含去重）
+    new_hashes = set()
+    final_sections = {}
     for sec_name, all_news in sections.items():
-        sections[sec_name] = select_with_fallback(sec_name, all_news)
+        selected = select_with_fallback(sec_name, all_news, pushed_hashes)
+        final_sections[sec_name] = selected
+        for item in selected:
+            h = hashlib.md5((item["title"] + item.get("url", "")).encode()).hexdigest()
+            new_hashes.add(h)
+        logger.info(f"{sec_name}: 推送 {len(selected)} 条")
 
-    translate_all(sections)
-    ai_extra = ai_summary_and_motto(sections)
-    msg = format_daily(sections, ai_extra)
-    push_wechat(msg)
-    logger.info("推送完成")
+    # 翻译
+    translate_all(final_sections)
+    # AI摘要
+    ai_extra = ai_summary_and_motto(final_sections)
+    # 格式化
+    msg = format_daily(final_sections, ai_extra)
+    # 推送
+    if any(items for items in final_sections.values()):
+        push_wechat(msg)
+        logger.info("推送成功")
+    else:
+        logger.info("无新内容，不推送")
+
+    # 更新缓存并提交
+    pushed_hashes.update(new_hashes)
+    save_pushed_hashes(pushed_hashes)
+    commit_cache()
 
 if __name__ == "__main__":
     main()

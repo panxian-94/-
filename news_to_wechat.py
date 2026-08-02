@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-日报风格新闻推送（智谱AI免费翻译 + 调试版）
+日报风格新闻推送（智谱AI免费翻译 + 分类修正版）
 """
 
 import os, sys, time, hashlib, logging, requests, feedparser, re, json
@@ -17,7 +17,7 @@ TODAY = datetime.now(TZ_BEIJING).strftime("%Y-%m-%d")
 MAX_WORKERS = 8
 REQUEST_TIMEOUT = 10
 
-# AI 配置（默认使用智谱AI GLM-4-Flash）
+# AI 配置（智谱AI GLM-4-Flash）
 ENABLE_AI = os.environ.get("ENABLE_AI_SUMMARY", "true").lower() == "true"
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
@@ -48,11 +48,12 @@ RSS_FEEDS = [
     {"url": "https://news.baidu.com/ns?word=%E4%BA%BA%E5%B7%A5%E6%99%BA%E8%83%BD+AI+%E5%A4%A7%E6%A8%A1%E5%9E%8B&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "category": "AI", "trust": 0.5},
 ]
 
+# 修正后的关键词权重表：每个类别加入强特征词，避免串类
 KEYWORD_SCORES = {
-    "国内新闻": {"经济":5,"就业":5,"CPI":5,"房贷":5,"利率":5,"医保":4,"社保":4,"交通":4,"天气":4,"预警":4,"政策":5},
-    "国际新闻": {"美联储":5,"汇率":5,"油价":5,"芯片":5,"俄乌":4,"中东":4,"欧洲":4,"全球":4},
-    "湖北武汉本地动态": {"武汉":5,"湖北":5,"施工":4,"地铁":4,"暴雨":4,"高温":4,"消费券":4,"烟草":5,"罗森":4},
-    "AI对普通人的影响": {"AI":5,"人工智能":5,"ChatGPT":5,"替代":4,"职业":4,"监管":4,"工具":4},
+    "国内新闻": {"中国":10, "国内":10, "经济":5, "就业":5, "CPI":5, "房贷":5, "利率":5, "医保":4, "社保":4, "交通":4, "天气":4, "预警":4, "政策":5, "人民币":5},
+    "国际新闻": {"美国":10, "欧洲":10, "日本":10, "韩国":10, "俄罗斯":10, "中东":10, "美联储":5, "汇率":5, "油价":5, "芯片":5, "全球":4, "Ukraine":5, "Russia":5, "BBC":5},
+    "湖北武汉本地动态": {"武汉":10, "湖北":10, "施工":5, "地铁":5, "暴雨":5, "高温":5, "消费券":5, "烟草":5, "罗森":5, "白沙洲":5},
+    "AI对普通人的影响": {"AI":10, "人工智能":10, "ChatGPT":10, "大模型":5, "替代":5, "职业":5, "监管":5, "工具":5},
 }
 
 def get_lunar_date():
@@ -175,9 +176,9 @@ def score_and_select(category: str, news_list: List[Dict], target: int = 50) -> 
             item["_score"] = score
         sorted_news = sorted(news_list, key=lambda x: (x["_score"], x["time"]), reverse=True)
         selected = sorted_news[:5]
-        for item in selected:
-            if item.get("trust", 1.0) < 0.7:
-                item["title"] += " [信源待核实]"
+    for item in selected:
+        if item.get("trust", 1.0) < 0.7:
+            item["title"] += " [信源待核实]"
     return selected
 
 def is_english_text(text: str) -> bool:
@@ -202,7 +203,6 @@ def translate_text(text: str) -> str:
             "temperature": 0.1,
         }
         url = f"{LLM_BASE_URL}/chat/completions"
-        logger.debug(f"请求翻译: URL={url}")
         resp = requests.post(url, json=data, headers=headers, timeout=15)
         if resp.status_code != 200:
             logger.error(f"翻译请求失败: {resp.status_code} {resp.text[:200]}")
@@ -296,16 +296,18 @@ def push_to_wechat(title: str, content: str):
 
 def main():
     logger.info("=== 开始日报新闻抓取 ===")
-    # 打印当前AI配置（隐藏key）
     logger.info(f"AI启用: {ENABLE_AI}, 模型: {LLM_MODEL}, BaseURL: {LLM_BASE_URL}")
     logger.info(f"LLM_API_KEY 是否配置: {'是' if LLM_API_KEY else '否'}")
 
     raw_pool = collect_all_news()
+    # 严格按RSS源类别分配板块，防止串类
     section_map = {
-        "国内": "国内新闻", "国际": "国际新闻",
-        "武汉": "湖北武汉本地动态", "AI": "AI对普通人的影响",
+        "国内": "国内新闻",
+        "国际": "国际新闻",
+        "武汉": "湖北武汉本地动态",
+        "AI": "AI对普通人的影响",
     }
-    sections = {v:[] for v in section_map.values()}
+    sections = {v: [] for v in section_map.values()}
     for raw_cat, news_list in raw_pool.items():
         sec_name = section_map.get(raw_cat)
         if sec_name:
@@ -314,9 +316,7 @@ def main():
     for sec_name in sections:
         sections[sec_name] = score_and_select(sec_name, sections[sec_name])
 
-    # 翻译英文
     translate_news_items(sections)
-
     ai_extra = ai_generate_intro_and_motto(sections)
     message = format_message(sections, ai_extra)
     push_to_wechat("每日日报", message)

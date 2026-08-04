@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-新闻+天气双板块日报（修复版）
-新闻子类：国内/国际/武汉/股票/便利店/人口/婚恋 各5条
-天气：武汉7日预报及提醒（可选，需和风天气API Key）
-智谱AI摘要+微语，PushPlus推送
+日报（30条综合新闻 + 天气）
+无分类，去重精选30条当天新闻
+天气和AI摘要为可选项
 """
 
 import os, sys, time, logging, requests, feedparser, re, json
@@ -13,13 +12,14 @@ from typing import List, Dict, Optional
 
 # ---------- 配置 ----------
 PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "")
-WEATHER_API_KEY = os.environ.get("WEATHER_API_KEY", "")  # 和风天气Key，可选
+WEATHER_API_KEY = os.environ.get("WEATHER_API_KEY", "")  # 和风天气，可选
 TZ_BEIJING = timezone(timedelta(hours=8))
 TODAY = datetime.now(TZ_BEIJING).strftime("%Y-%m-%d")
 MAX_WORKERS = 8
 REQUEST_TIMEOUT = 12
+TARGET_NEWS = 30  # 推送30条
 
-# 智谱AI（用于摘要和翻译）
+# 智谱AI（可选）
 ENABLE_AI = os.environ.get("ENABLE_AI_SUMMARY", "true").lower() == "true"
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
@@ -28,48 +28,24 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "glm-4-flash")
 logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-# ========== 新闻子分类定义 ==========
-NEWS_SUBCATEGORIES = {
-    "国内": "国内新闻",
-    "国际": "国际新闻",
-    "武汉": "湖北武汉本地",
-    "股票": "股票行业情报",
-    "便利店": "便利店动态",
-    "人口": "中国人口动态",
-    "婚恋": "婚恋市场观察"
-}
-
-# ========== RSS 源（已按子分类分配）==========
+# ========== 多源 RSS（无分类）==========
 RSS_FEEDS = [
-    # 国内
-    {"url": "https://news.baidu.com/ns?word=%E4%B8%AD%E5%9B%BD+%E7%BB%8F%E6%B5%8E+%E6%B0%91%E7%94%9F&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "sub": "国内"},
-    {"url": "http://www.xinhuanet.com/politics/xhsll.xml", "sub": "国内"},
-    # 国际
-    {"url": "https://feeds.bbci.co.uk/news/world/rss.xml", "sub": "国际"},
-    {"url": "https://news.baidu.com/ns?word=%E5%9B%BD%E9%99%85+%E7%BE%8E%E5%9B%BD+%E6%AC%A7%E6%B4%B2&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "sub": "国际"},
-    # 武汉
-    {"url": "https://news.baidu.com/ns?word=%E6%AD%A6%E6%B1%89+%E6%B9%96%E5%8C%97+%E5%9C%B0%E9%93%81+%E5%A4%A9%E6%B0%94&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "sub": "武汉"},
-    {"url": "http://hb.people.com.cn/rss/hubei.xml", "sub": "武汉"},
-    # 股票
-    {"url": "https://news.baidu.com/ns?word=%E8%82%A1%E5%B8%82+%E9%9B%B6%E5%94%AE+%E6%B6%88%E8%B4%B9&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "sub": "股票"},
-    # 便利店
-    {"url": "https://news.baidu.com/ns?word=%E4%BE%BF%E5%88%A9%E5%BA%97+%E9%9B%B6%E5%94%AE+%E5%BF%AB%E6%B6%88&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "sub": "便利店"},
-    # 人口
-    {"url": "https://news.baidu.com/ns?word=%E4%B8%AD%E5%9B%BD%E4%BA%BA%E5%8F%A3+%E5%87%BA%E7%94%9F%E7%8E%87+%E8%80%81%E9%BE%84%E5%8C%96&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "sub": "人口"},
-    # 婚恋
-    {"url": "https://news.baidu.com/ns?word=%E5%A9%9A%E6%81%8B%E5%B8%82%E5%9C%BA+%E7%BB%93%E5%A9%9A%E7%8E%87+%E7%A6%BB%E5%A9%9A%E7%8E%87&tn=newsrss&sr=0&cl=2&rn=50&ct=0", "sub": "婚恋"},
+    "http://www.xinhuanet.com/politics/xhsll.xml",
+    "http://www.people.com.cn/rss/politics.xml",
+    "https://www.chinanews.com/rss/rss_1.html",
+    "https://www.thepaper.cn/rss_news_1.xml",
+    "https://news.sina.com.cn/rss/1.xml",
+    "https://news.163.com/special/002341KK/rss_news.xml",
+    "https://feeds.bbci.co.uk/news/world/rss.xml",
+    "https://www.chinadaily.com.cn/rss/world_rss.xml",
+    "https://news.google.com/rss?hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
+    "https://www.36kr.com/feed",
+    "https://www.huxiu.com/rss/0.html",
+    "https://www.cls.cn/api/sw?app=CailianpressWeb&os=web&sv=8.4.6",  # 财联社
+    # 百度聚合（综合）
+    "https://news.baidu.com/ns?word=%E7%83%AD%E7%82%B9&tn=newsrss&sr=0&cl=2&rn=50&ct=0",
+    "https://news.baidu.com/ns?word=%E5%9B%BD%E5%86%85+%E5%9B%BD%E9%99%85&tn=newsrss&sr=0&cl=2&rn=50&ct=0",
 ]
-
-# ========== 关键词评分（用于精选）==========
-KEYWORD_SCORES = {
-    "国内": ["中国","国内","经济","就业","政策","社会"],
-    "国际": ["美国","欧洲","俄罗斯","中东","美联储","汇率","油价"],
-    "武汉": ["武汉","湖北","地铁","施工","天气","暴雨","高温"],
-    "股票": ["A股","上证","指数","券商","零售","消费","研报"],
-    "便利店": ["便利店","零售","快消","罗森","7-11","加盟"],
-    "人口": ["人口","出生率","老龄化","三孩","生育","计生"],
-    "婚恋": ["婚恋","结婚","离婚","相亲","彩礼","单身","婚介"]
-}
 
 # ========== 天气 ==========
 def get_wuhan_weather() -> Optional[List[Dict]]:
@@ -79,7 +55,7 @@ def get_wuhan_weather() -> Optional[List[Dict]]:
         url = f"https://devapi.qweather.com/v7/weather/7d?location=101200101&key={WEATHER_API_KEY}"
         resp = requests.get(url, timeout=10)
         if resp.status_code != 200:
-            logger.error(f"天气API请求失败: {resp.status_code}")
+            logger.error(f"天气请求失败: {resp.status_code}")
             return None
         data = resp.json()
         if data.get("code") != "200":
@@ -87,7 +63,7 @@ def get_wuhan_weather() -> Optional[List[Dict]]:
             return None
         return data.get("daily", [])
     except Exception as e:
-        logger.error(f"天气获取异常: {e}")
+        logger.error(f"天气异常: {e}")
         return None
 
 def format_weather(daily: List[Dict]) -> str:
@@ -96,29 +72,43 @@ def format_weather(daily: List[Dict]) -> str:
     text = "\n🌤️ 武汉未来7日天气预报\n"
     for day in daily:
         text += f"{day['fxDate']}: {day['textDay']}，{day['tempMin']}~{day['tempMax']}℃，风力{day['windScaleDay']}级\n"
-    # 智能提醒
     warnings = []
     for day in daily[:3]:
         if "雨" in day["textDay"]:
             warnings.append("未来三天有降雨，出门请带伞")
             break
-    max_temps = [int(day["tempMax"]) for day in daily[:3]]
-    if max_temps and max(max_temps) >= 35:
+    temps = [int(day["tempMax"]) for day in daily[:3]]
+    if temps and max(temps) >= 35:
         warnings.append("高温天气，注意防暑降温")
     if warnings:
         text += "\n⚠️ 提醒: " + "；".join(warnings) + "\n"
     return text
 
 # ========== RSS 抓取 ==========
-def fetch_rss(feed_info: Dict) -> List[Dict]:
+def fetch_rss(url: str) -> List[Dict]:
     news = []
     try:
-        url = feed_info["url"]
         sep = "?" if "?" not in url else "&"
         full_url = f"{url}{sep}_t={int(time.time())}"
         headers = {"User-Agent": "Mozilla/5.0"}
         resp = requests.get(full_url, headers=headers, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
+
+        # 特殊处理财联社API
+        if "cls.cn" in url:
+            data = resp.json()
+            articles = data.get("data", {}).get("roll_data", [])[:50]
+            for art in articles:
+                title = art.get("title", "")
+                ctime = art.get("ctime", 0)
+                if ctime:
+                    pub_time = datetime.fromtimestamp(ctime, tz=TZ_BEIJING)
+                    if pub_time.strftime("%Y-%m-%d") != TODAY: continue
+                    summary = re.sub(r"<[^>]+>", "", art.get("brief", ""))[:150]
+                    news.append({"title": title, "summary": summary,
+                                 "source": "cls.cn", "time": pub_time.strftime("%Y-%m-%d %H:%M")})
+            return news
+
         feed = feedparser.parse(resp.content)
         for entry in feed.entries:
             pub_time = None
@@ -128,40 +118,34 @@ def fetch_rss(feed_info: Dict) -> List[Dict]:
                 pub_time = datetime(*entry.updated_parsed[:6], tzinfo=timezone.utc).astimezone(TZ_BEIJING)
             if not pub_time:
                 continue
-            time_str = pub_time.strftime("%Y-%m-%d %H:%M")
-            if TODAY not in time_str:
+            if pub_time.strftime("%Y-%m-%d") != TODAY:
                 continue
-            title = entry.get("title","").strip()
-            summary = re.sub(r"<[^>]+>", "", entry.get("summary",""))[:200].strip()
+            title = entry.get("title", "").strip()
+            summary = re.sub(r"<[^>]+>", "", entry.get("summary", ""))[:150].strip()
             news.append({
                 "title": title,
                 "summary": summary,
                 "source": url.split("//")[-1].split("/")[0],
-                "time": time_str,
-                "sub": feed_info["sub"]
+                "time": pub_time.strftime("%Y-%m-%d %H:%M")
             })
     except Exception as e:
         logger.debug(f"源 {url[:60]} 失败: {e}")
     return news
 
-def collect_news() -> Dict[str, List[Dict]]:
-    pool = {sub: [] for sub in NEWS_SUBCATEGORIES}
+def collect_all_news() -> List[Dict]:
+    all_news = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(fetch_rss, f): f for f in RSS_FEEDS}
+        futures = {executor.submit(fetch_rss, url): url for url in RSS_FEEDS}
         for future in as_completed(futures):
-            feed_info = futures[future]
             try:
                 result = future.result()
-                sub = feed_info["sub"]
-                if sub in pool:
-                    pool[sub].extend(result)
+                all_news.extend(result)
             except Exception as e:
                 logger.warning(f"任务异常: {e}")
-    return pool
+    return all_news
 
-def select_top(sub: str, news_list: List[Dict], global_news: List[Dict], count=5) -> List[Dict]:
-    """从 news_list 中选 count 条，不足则从 global_news 中补足（全局备选）"""
-    # 去重（按标题）
+def deduplicate_and_select(news_list: List[Dict], target=30) -> List[Dict]:
+    """去重并按时间降序取前 target 条"""
     seen = set()
     unique = []
     for item in sorted(news_list, key=lambda x: x["time"], reverse=True):
@@ -170,32 +154,8 @@ def select_top(sub: str, news_list: List[Dict], global_news: List[Dict], count=5
             continue
         seen.add(h)
         unique.append(item)
-
-    # 关键词评分
-    kw = KEYWORD_SCORES.get(sub, [])
-    for item in unique:
-        score = sum(1 for w in kw if w in item["title"])
-        item["_score"] = score
-
-    ranked = sorted(unique, key=lambda x: (x["_score"], x["time"]), reverse=True)
-    selected = ranked[:count]
-
-    # 如果不足，从全局新闻中借用（同样去重）
-    if len(selected) < count and global_news:
-        seen_titles = {item["title"] for item in selected}
-        rest = []
-        for item in sorted(global_news, key=lambda x: x["time"], reverse=True):
-            if item["title"] not in seen_titles:
-                rest.append(item)
-                seen_titles.add(item["title"])
-        # 对借用新闻简单评分
-        for item in rest:
-            score = sum(1 for w in kw if w in item["title"])
-            item["_score"] = score
-        rest_sorted = sorted(rest, key=lambda x: (x["_score"], x["time"]), reverse=True)
-        selected += rest_sorted[:count-len(selected)]
-
-    return selected[:count]
+    logger.info(f"去重后共 {len(unique)} 条，选取前 {target} 条")
+    return unique[:target]
 
 # ========== 翻译 ==========
 def is_english(text: str) -> bool:
@@ -215,22 +175,19 @@ def translate(text: str) -> str:
         return resp.json()["choices"][0]["message"]["content"].strip()
     except: return text
 
-def translate_news(pool: Dict[str, List[Dict]]):
-    for items in pool.values():
-        for item in items:
-            if is_english(item["title"]):
-                item["title"] = translate(item["title"])
-            if is_english(item["summary"]):
-                item["summary"] = translate(item["summary"])
+def translate_news(news: List[Dict]):
+    for item in news:
+        if is_english(item["title"]):
+            item["title"] = translate(item["title"])
+        if is_english(item["summary"]):
+            item["summary"] = translate(item["summary"])
 
 # ========== AI 摘要 ==========
-def ai_summary(selected_pool: Dict[str, List[Dict]]) -> str:
-    if not ENABLE_AI or not LLM_API_KEY: return ""
+def ai_summary(news: List[Dict]) -> str:
+    if not ENABLE_AI or not LLM_API_KEY:
+        return ""
     try:
-        titles = []
-        for sub, items in selected_pool.items():
-            for item in items:
-                titles.append(f"[{NEWS_SUBCATEGORIES[sub]}] {item['title']}")
+        titles = [item["title"] for item in news[:15]]  # 只传前15条避免过长
         prompt = (
             "根据以下新闻标题，生成一句15字内的今日新闻总结，并附一句50字内的正能量微语。"
             "返回JSON：{\"summary\":\"...\",\"motto\":\"...\"}"
@@ -248,7 +205,7 @@ def ai_summary(selected_pool: Dict[str, List[Dict]]) -> str:
     return ""
 
 # ========== 格式化 ==========
-def build_message(selected_pool: Dict[str, List[Dict]], weather_text: str, ai_text: str) -> str:
+def build_message(news: List[Dict], weather_text: str, ai_text: str) -> str:
     now = datetime.now(TZ_BEIJING)
     weekday = ["星期一","星期二","星期三","星期四","星期五","星期六","星期日"][now.weekday()]
     date_str = now.strftime("%Y年%m月%d日")
@@ -257,16 +214,10 @@ def build_message(selected_pool: Dict[str, List[Dict]], weather_text: str, ai_te
     if weather_text:
         header += weather_text + "\n"
 
-    body = "━━━━━━ 今日新闻 ━━━━━━\n"
-    for sub, full_name in NEWS_SUBCATEGORIES.items():
-        items = selected_pool.get(sub, [])
-        body += f"\n【{full_name}】\n"
-        if not items:
-            body += "  今日暂无更新\n"
-        else:
-            for i, item in enumerate(items, 1):
-                body += f"  {i}. {item['title']}\n"
-    body += "\n"
+    body = "━━━━━━ 今日新闻 TOP 30 ━━━━━━\n"
+    for i, item in enumerate(news, 1):
+        body += f"{i}. {item['title']}\n"
+        body += f"   {item['source']} · {item['time']}\n\n"
 
     if ai_text:
         body += f"{ai_text}\n"
@@ -283,28 +234,21 @@ def push_wechat(content: str):
     logger.info("推送成功")
 
 def main():
-    logger.info("开始采集新闻与天气...")
-    raw_news = collect_news()
+    logger.info("开始采集新闻...")
+    raw_news = collect_all_news()
     translate_news(raw_news)
 
-    # 生成全局新闻列表（用于兜底补充）
-    all_news_flat = []
-    for lst in raw_news.values():
-        all_news_flat.extend(lst)
+    # 精选30条
+    selected = deduplicate_and_select(raw_news, TARGET_NEWS)
 
-    # 精选每个子类5条
-    selected = {}
-    for sub in NEWS_SUBCATEGORIES:
-        selected[sub] = select_top(sub, raw_news.get(sub, []), all_news_flat)
-
-    # 天气
+    # 天气（可选）
     daily = get_wuhan_weather()
     weather_text = format_weather(daily) if daily else ""
 
-    # AI摘要
+    # AI 摘要（可选）
     ai_text = ai_summary(selected)
 
-    # 组合并推送
+    # 组装并推送
     msg = build_message(selected, weather_text, ai_text)
     push_wechat(msg)
     logger.info("推送完成")
